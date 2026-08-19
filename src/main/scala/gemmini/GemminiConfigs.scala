@@ -81,6 +81,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              tile_latency: Int = 0,
                                                                              mesh_output_delay: Int = 1,
 
+                                                                             // Ask FPGA synthesis to implement each spatial-array MAC with a DSP.
+                                                                             // This is disabled by default because it is a vendor-specific mapping hint.
+                                                                             use_dsp_for_mac: Boolean = false,
+
                                                                              use_tree_reduction_if_possible: Boolean = true,
 
                                                                              num_counter: Int = 8,

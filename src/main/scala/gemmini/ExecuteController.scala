@@ -184,7 +184,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(spatialArrayInputType, spatialArrayWeightType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
-    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks))
+    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks,
+    use_dsp_for_mac = use_dsp_for_mac))
 
   mesh.io.a.valid := false.B
   mesh.io.b.valid := false.B

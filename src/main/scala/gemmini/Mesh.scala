@@ -18,7 +18,8 @@ class Mesh[T <: Data : Arithmetic](inputType: T, weightType: T, outputType: T, a
                                    df: Dataflow.Value, tree_reduction: Boolean, tile_latency: Int,
                                    max_simultaneous_matmuls: Int, output_delay: Int,
                                    val tileRows: Int, val tileColumns: Int,
-                                   val meshRows: Int, val meshColumns: Int) extends Module {
+                                   val meshRows: Int, val meshColumns: Int,
+                                   use_dsp_for_mac: Boolean = false) extends Module {
   val io = IO(new Bundle {
     val in_a = Input(Vec(meshRows, Vec(tileRows, inputType)))
     val in_b = Input(Vec(meshColumns, Vec(tileColumns, weightType)))
@@ -36,7 +37,9 @@ class Mesh[T <: Data : Arithmetic](inputType: T, weightType: T, outputType: T, a
   })
 
   // mesh(r)(c) => Tile at row r, column c
-  val mesh: Seq[Seq[Tile[T]]] = Seq.fill(meshRows, meshColumns)(Module(new Tile(inputType, weightType, outputType, accType, df, tree_reduction, max_simultaneous_matmuls, tileRows, tileColumns)))
+  val mesh: Seq[Seq[Tile[T]]] = Seq.fill(meshRows, meshColumns)(Module(new Tile(
+    inputType, weightType, outputType, accType, df, tree_reduction,
+    max_simultaneous_matmuls, tileRows, tileColumns, use_dsp_for_mac)))
   val meshT = mesh.transpose
 
   def pipe[T <: Data](valid: Bool, t: T, latency: Int): T = {
