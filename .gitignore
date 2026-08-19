@@ -343,3 +343,5 @@ configs/
 generated-src/
 waveforms/
 
+#vscode
+.vscode-ctags
