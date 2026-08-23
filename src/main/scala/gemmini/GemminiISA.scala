@@ -160,7 +160,9 @@ object GemminiISA {
   }
 
   val CONFIG_NORM_RS1_Q_CONST_WIDTH = 32
-  val CONFIG_NORM_RS1_SPACER1_WIDTH = 13
+  val CONFIG_NORM_RS1_SPACER1_WIDTH = 7
+  val CONFIG_NORM_RS1_SILU_LUT_CHUNK_WIDTH = 5
+  val CONFIG_NORM_RS1_SILU_LUT_WRITE_WIDTH = 1
   val CONFIG_NORM_RS1_Q_CONST_TYPE_WIDTH = 1
   val CONFIG_NORM_RS1_SET_STATS_ID_ONLY_WIDTH = 1
   val CONFIG_NORM_RS1_ACT_MSB_WIDTH = 1
@@ -171,6 +173,8 @@ object GemminiISA {
   class ConfigNormRs1(acc_t_bits: Int = 32) extends Bundle {
     val q_const = UInt(acc_t_bits.W)
     val _spacer1 = UInt(CONFIG_NORM_RS1_SPACER1_WIDTH.W)
+    val silu_lut_chunk = UInt(CONFIG_NORM_RS1_SILU_LUT_CHUNK_WIDTH.W)
+    val silu_lut_write = UInt(CONFIG_NORM_RS1_SILU_LUT_WRITE_WIDTH.W)
     val q_const_type = UInt(CONFIG_NORM_RS1_Q_CONST_TYPE_WIDTH.W)
     val set_stats_id_only = UInt(CONFIG_NORM_RS1_SET_STATS_ID_ONLY_WIDTH.W)
     val act_msb = UInt(CONFIG_NORM_RS1_ACT_MSB_WIDTH.W)
@@ -250,4 +254,3 @@ object GemminiISA {
     val local_addr = local_addr_t.cloneType
   }
 }
-

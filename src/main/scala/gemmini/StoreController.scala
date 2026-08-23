@@ -119,6 +119,9 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   val config_iexp_q_const = config_norm_rs1.q_const
   val config_igelu_qb = config_norm_rs2.qb
   val config_igelu_qc = config_norm_rs2.qc
+  val config_silu_lut_write = config_norm_rs1.silu_lut_write
+  val config_silu_lut_chunk = config_norm_rs1.silu_lut_chunk
+  val config_silu_lut_data = cmd.bits.cmd.rs2
 
   assert(config_norm_rs1.cmd_type === config_mvout_rs1.cmd_type)
 
@@ -136,10 +139,14 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   val pool_vaddr = vaddr + (porow_counter * pool_out_dim + pocol_counter) * stride // TODO get rid of these multiplications
 
   val DoConfig = cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_STORE
-  val DoConfigNorm = config.has_normalizations.B && cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM
+  val DoConfigNorm = (config.has_normalizations || config.has_silu_lut).B &&
+    cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM
   val DoStore = !DoConfig && !DoConfigNorm
 
   cmd.ready := false.B
+  io.dma.silu_lut_write.valid := false.B
+  io.dma.silu_lut_write.bits.chunk := config_silu_lut_chunk
+  io.dma.silu_lut_write.bits.data := config_silu_lut_data
 
   val mvout_1d_rows = pool_orows * pool_ocols //for 1D mvout
   // Command tracker instantiation
@@ -255,19 +262,32 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
           }
           cmd.ready := true.B
         }
-        .elsewhen(config.has_normalizations.B && DoConfigNorm) {
-          when (!config_set_stats_id_only.asBool) {
-            igelu_qb := config_igelu_qb.asTypeOf(igelu_qb)
-            igelu_qc := config_igelu_qc.asTypeOf(igelu_qc)
-            when(config_iexp_q_const_type === 0.U) {
-              iexp_qln2 := config_iexp_q_const.asTypeOf(iexp_qln2)
-            }.elsewhen(config_iexp_q_const_type === 1.U) {
-              iexp_qln2_inv := config_iexp_q_const.asTypeOf(iexp_qln2_inv)
+        .elsewhen(DoConfigNorm) {
+          when (config_silu_lut_write.asBool) {
+            if (config.has_silu_lut) {
+              // Backpressure this CONFIG_NORM command until Scratchpad has
+              // drained all older values which have not yet sampled the LUT.
+              io.dma.silu_lut_write.valid := true.B
+              cmd.ready := io.dma.silu_lut_write.ready
+            } else {
+              // Preserve CONFIG_NORM compatibility in configurations which
+              // implement normalizations but not the programmable SiLU LUT.
+              cmd.ready := true.B
             }
-            activation := Cat(config_activation_msb, activation(1, 0)) // TODO: magic number
+          }.otherwise {
+            when (!config_set_stats_id_only.asBool) {
+              igelu_qb := config_igelu_qb.asTypeOf(igelu_qb)
+              igelu_qc := config_igelu_qc.asTypeOf(igelu_qc)
+              when(config_iexp_q_const_type === 0.U) {
+                iexp_qln2 := config_iexp_q_const.asTypeOf(iexp_qln2)
+              }.elsewhen(config_iexp_q_const_type === 1.U) {
+                iexp_qln2_inv := config_iexp_q_const.asTypeOf(iexp_qln2_inv)
+              }
+              activation := Cat(config_activation_msb, activation(1, 0)) // TODO: magic number
+            }
+            norm_stats_id := config_stats_id
+            cmd.ready := true.B
           }
-          norm_stats_id := config_stats_id
-          cmd.ready := true.B
         }
         .elsewhen(DoStore && cmd_tracker.io.alloc.fire()) {
           val next_state = Mux(pooling_is_enabled, pooling, sending_rows)

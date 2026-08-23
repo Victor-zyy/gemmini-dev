@@ -24,6 +24,66 @@ class AccumulatorScaleIO[T <: Data: Arithmetic, U <: Data](
 ) extends Bundle {
   val in = Flipped(Decoupled(new NormalizedOutput[T,U](fullDataType, scale_t)))
   val out = Decoupled(new AccumulatorScaleResp[T](fullDataType, rDataType))
+  val silu_lut_write = Flipped(Decoupled(new SiLULutWrite))
+}
+
+class AccumulatorScaleTaggedResp[T <: Data: Arithmetic](
+  fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]]) extends Bundle {
+  val resp = new AccumulatorScaleResp[T](fullDataType, rDataType)
+  val act = UInt(Activation.bitwidth.W)
+}
+
+/**
+  * A combinational SiLU sidecar which leaves the legacy accumulator response
+  * handshake and latency unchanged.
+  *
+  * Each INT8 output lane owns a 32 x 64-bit asynchronous LUTRAM. The LUTRAM
+  * address is held at zero for legacy activations, avoiding unnecessary table
+  * activity. Only the small INT8 data field is selected; full-width
+  * accumulator data and all ready/valid signals stay on the original path.
+  * Software fences before replacing the table, so LUT writes never need to
+  * backpressure or observe the accumulator/LoopConv pipelines.
+  */
+class AccumulatorSiluPostProcess[T <: Data: Arithmetic](
+  fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]]) extends Module {
+  val io = IO(new Bundle {
+    val in = Input(new AccumulatorScaleTaggedResp[T](fullDataType, rDataType))
+    val out = Output(new AccumulatorScaleResp[T](fullDataType, rDataType))
+    val lut_write = Flipped(Decoupled(new SiLULutWrite))
+  })
+
+  val nRows = rDataType.size
+  val nCols = rDataType.head.size
+  val nLanes = nRows * nCols
+  val chunkWidth = SiLULut.entriesPerWrite * SiLULut.entryBits
+
+  // One logical read port per INT8 output lane. Synthesis can implement these
+  // shallow memories as replicated LUTRAM instead of a high-fanout register
+  // table and a large distributed mux network.
+  val laneLuts = Seq.fill(nLanes)(Mem(SiLULut.chunks, UInt(chunkWidth.W)))
+  when (io.lut_write.fire) {
+    laneLuts.foreach(_.write(io.lut_write.bits.chunk, io.lut_write.bits.data))
+  }
+  io.lut_write.ready := true.B
+
+  io.out := io.in.resp
+  val useSilu = io.in.act === Activation.SILU
+
+  for (row <- 0 until nRows; col <- 0 until nCols) {
+    val lane = row * nCols + col
+    val qMid = io.in.resp.data(row)(col)
+    val qIndex = qMid.asUInt
+    val chunkAddress = Mux(useSilu, qIndex(7, 3), 0.U)
+    val chunk = laneLuts(lane).read(chunkAddress)
+    val entries = VecInit.tabulate(SiLULut.entriesPerWrite) { lane =>
+      val hi = (lane + 1) * SiLULut.entryBits - 1
+      val lo = lane * SiLULut.entryBits
+      chunk(hi, lo)
+    }
+    val lutValue = entries(qIndex(2, 0))
+    val signedValue = lutValue.asSInt.pad(qMid.getWidth).asTypeOf(qMid)
+    io.out.data(row)(col) := Mux(useSilu, signedValue, qMid)
+  }
 }
 
 class AccScaleDataWithIndex[T <: Data: Arithmetic, U <: Data](t: T, u: U) extends Bundle {
@@ -94,17 +154,20 @@ class AccumulatorScale[T <: Data, U <: Data](
   scale_func: (T, U) => T,
   num_scale_units: Int,
   latency: Int,
-  has_nonlinear_activations: Boolean, has_normalizations: Boolean)(implicit ev: Arithmetic[T]) extends Module {
+  has_nonlinear_activations: Boolean, has_normalizations: Boolean,
+  has_silu_lut: Boolean)(implicit ev: Arithmetic[T]) extends Module {
 
   import ev._
 
   val io = IO(new AccumulatorScaleIO[T,U](
     fullDataType, scale_t, rDataType
   )(ev))
+
   val t = io.in.bits.acc_read_resp.data(0)(0).cloneType
   val acc_read_data = io.in.bits.acc_read_resp.data
   val out = Wire(Decoupled(new AccumulatorScaleResp[T](
     fullDataType, rDataType)(ev)))
+  val outAct = Wire(UInt(Activation.bitwidth.W))
 
   if (num_scale_units == -1) {
     val data = io.in.bits.acc_read_resp.data
@@ -155,6 +218,7 @@ class AccumulatorScale[T <: Data, U <: Data](
     out.bits.data      := pipe_out.bits.resp.data
     out.bits.fromDMA   := pipe_out.bits.resp.fromDMA
     out.bits.acc_bank_id := pipe_out.bits.resp.acc_bank_id
+    outAct := pipe_out.bits.resp.act
   } else {
     val width = acc_read_data.size * acc_read_data(0).size
     val nEntries = 3
@@ -164,6 +228,7 @@ class AccumulatorScale[T <: Data, U <: Data](
       fullDataType, scale_t)(ev))))
     val out_regs = Reg(Vec(nEntries, new AccumulatorScaleResp[T](
       fullDataType, rDataType)(ev)))
+    val out_acts = Reg(Vec(nEntries, UInt(Activation.bitwidth.W)))
 
     val fired_masks = Reg(Vec(nEntries, Vec(width, Bool())))
     val completed_masks = Reg(Vec(nEntries, Vec(width, Bool())))
@@ -171,6 +236,7 @@ class AccumulatorScale[T <: Data, U <: Data](
     val tail_oh = RegInit(1.U(nEntries.W))
     out.valid := Mux1H(head_oh.asBools, (regs zip completed_masks).map({case (r, c) => r.valid && c.reduce(_&&_)}))
     out.bits  := Mux1H(head_oh.asBools, out_regs)
+    outAct := Mux1H(head_oh.asBools, out_acts)
     when (out.fire) {
       for (i <- 0 until nEntries) {
         when (head_oh(i)) {
@@ -188,6 +254,7 @@ class AccumulatorScale[T <: Data, U <: Data](
           regs(i).bits  := io.in.bits
           out_regs(i).fromDMA := io.in.bits.acc_read_resp.fromDMA
           out_regs(i).acc_bank_id := io.in.bits.acc_read_resp.acc_bank_id
+          out_acts(i) := io.in.bits.acc_read_resp.act
           fired_masks(i).foreach(_ := false.B)
           completed_masks(i).foreach(_ := false.B)
         }
@@ -360,16 +427,28 @@ class AccumulatorScale[T <: Data, U <: Data](
     }
   }
 
-  io.out <> out
+  if (has_silu_lut) {
+    val siluPost = Module(new AccumulatorSiluPostProcess(fullDataType, rDataType))
+    siluPost.io.in.resp := out.bits
+    siluPost.io.in.act := outAct
+    siluPost.io.lut_write.valid := io.silu_lut_write.valid
+    siluPost.io.lut_write.bits := io.silu_lut_write.bits
+    io.silu_lut_write.ready := siluPost.io.lut_write.ready
 
-  if (read_small_data)
-    io.out.bits.data := out.bits.data
-  else
+    // Preserve the pre-SiLU ready/valid path exactly. The sidecar changes only
+    // the response data bits when this transaction is tagged as SILU.
+    io.out.valid := out.valid
+    out.ready := io.out.ready
+    io.out.bits := siluPost.io.out
+  } else {
+    io.silu_lut_write.ready := true.B
+    io.out <> out
+  }
+
+  if (!read_small_data)
     io.out.bits.data := DontCare
 
-  if (read_full_data)
-    io.out.bits.full_data := out.bits.full_data
-  else
+  if (!read_full_data)
     io.out.bits.full_data := DontCare
 }
 
@@ -421,4 +500,3 @@ object AccumulatorScale {
     val q_erf = (q_sign * q_poly).withWidthOf(q)
     (q * (q_erf + qc)).withWidthOf(q)
   }}
-

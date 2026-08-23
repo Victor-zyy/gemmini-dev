@@ -71,6 +71,7 @@ class ScratchpadWriteMemIO(local_addr_t: LocalAddr, acc_t_bits: Int, scale_t_bit
                          (implicit p: Parameters) extends CoreBundle {
   val req = Decoupled(new ScratchpadMemWriteRequest(local_addr_t, acc_t_bits, scale_t_bits))
   val resp = Flipped(Valid(new ScratchpadMemWriteResponse))
+  val silu_lut_write = Decoupled(new SiLULutWrite)
 }
 
 class ScratchpadReadReq(val n: Int) extends Bundle {
@@ -643,6 +644,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       acc_scale_latency,
       has_nonlinear_activations,
       has_normalizations,
+      has_silu_lut,
     ))
 
     val acc_waiting_to_be_scaled = write_scale_q.io.deq.valid &&
@@ -653,6 +655,14 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     acc_norm_unit_out.ready := acc_scale_unit.io.in.ready && acc_waiting_to_be_scaled
     acc_scale_unit.io.in.valid := acc_norm_unit_out.valid && acc_waiting_to_be_scaled
     acc_scale_unit.io.in.bits  := acc_norm_unit_out.bits
+
+    // LUT replacement is fenced by software. Keep this configuration path
+    // independent of accumulator reads and LoopConv control/retirement.
+    acc_scale_unit.io.silu_lut_write.valid :=
+      io.dma.write.silu_lut_write.valid
+    acc_scale_unit.io.silu_lut_write.bits := io.dma.write.silu_lut_write.bits
+    io.dma.write.silu_lut_write.ready :=
+      acc_scale_unit.io.silu_lut_write.ready
 
     when (acc_scale_unit.io.in.fire) {
       write_issue_q.io.enq <> write_scale_q.io.deq

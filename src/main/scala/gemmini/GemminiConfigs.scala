@@ -92,6 +92,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_training_convs: Boolean = true,
                                                                              has_max_pool: Boolean = true,
                                                                              has_nonlinear_activations: Boolean = true,
+                                                                             has_silu_lut: Boolean = false,
                                                                              has_dw_convs: Boolean = true,
                                                                              has_normalizations: Boolean = false,
                                                                              has_first_layer_optimizations: Boolean = true,
@@ -107,6 +108,11 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
   require(inputType.getWidth == weightType.getWidth)
+  require(!has_silu_lut || (
+    has_nonlinear_activations &&
+    inputType.isInstanceOf[SInt] && inputType.getWidth == SiLULut.entryBits &&
+    accType.isInstanceOf[SInt]),
+    "The programmable SiLU LUT requires signed INT8 elements, a signed accumulator, and nonlinear activations")
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
@@ -506,6 +512,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     if (has_normalizations) {
       header ++= "#define HAS_NORMALIZATIONS\n"
       header ++= "#define NORM_STAT_IDS 2\n\n"
+    }
+
+    if (has_silu_lut) {
+      header ++= "#define HAS_SILU_LUT\n\n"
     }
 
     header ++= s"#endif // $guard\n"
