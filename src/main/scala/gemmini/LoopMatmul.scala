@@ -23,6 +23,7 @@ class LoopMatmulLdAReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val addr_start = UInt(log2Up(max_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
   val is_resadd = Bool()
+  val is_exact_resadd = Bool()
 }
 
 class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, input_w: Int,
@@ -83,6 +84,8 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   mvin_cmd.rs2 := mvin_cmd_rs2.asUInt
   when(req.is_resadd){
     mvin_cmd_rs2.local_addr := cast_to_acc_addr(mvin_cmd_rs2.local_addr, sp_addr, accumulate = false.B, read_full = false.B)
+    if (mvin_cmd_rs2.local_addr.garbage.getWidth > 0)
+      mvin_cmd_rs2.local_addr.garbage := req.is_exact_resadd.asUInt
   }
 
   io.req.ready := state === idle
@@ -134,6 +137,7 @@ class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val addr_end = UInt(log2Up(max_addr+1).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
   val is_resadd = Bool()
+  val is_exact_resadd = Bool()
 }
 
 class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, input_w: Int,
@@ -198,6 +202,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   when (req.is_resadd){
     mvin_cmd_rs2.local_addr := cast_to_acc_addr(mvin_cmd_rs2.local_addr, sp_addr, accumulate = true.B, read_full = false.B)
+    if (mvin_cmd_rs2.local_addr.garbage.getWidth > 0)
+      mvin_cmd_rs2.local_addr.garbage := req.is_exact_resadd.asUInt
   }
 
   io.req.ready := state === idle
@@ -922,6 +928,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_being_configured = loops(loop_being_configured_id)
 
   val is_resadd = RegInit(false.B)
+  val is_exact_resadd = RegInit(false.B)
 
   val max_all_addr = if(max_addr > max_acc_addr) max_addr else max_acc_addr 
   // Create inner modules
@@ -1103,6 +1110,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.a_transpose := cmd.bits.cmd.rs2(0)
         loop_being_configured.b_transpose := cmd.bits.cmd.rs2(1)
         is_resadd := cmd.bits.cmd.rs2(2)
+        is_exact_resadd := cmd.bits.cmd.rs2(10)
+        assert(!cmd.bits.cmd.rs2(10) || cmd.bits.cmd.rs2(2),
+          "Exact ResAdd LOOP_WS bit requires the ResAdd bit")
 
         loop_being_configured.configured := true.B
 
@@ -1128,6 +1138,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldA.io.req.bits.addr_start := Mux(loop_requesting_ldA.a_ex_spad_id === 0.U, loop_requesting_ldA.a_addr_start, (loop_requesting_ldA.a_ex_spad_id - 1.U) * (max_addr / concurrent_loops).U)
   ldA.io.req.bits.loop_id := loop_requesting_ldA_id
   ldA.io.req.bits.is_resadd := is_resadd
+  ldA.io.req.bits.is_exact_resadd := is_exact_resadd
 
   ldA.io.req.valid := !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured
 
@@ -1148,6 +1159,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldB.io.req.bits.addr_end := Mux(loop_requesting_ldB.b_ex_spad_id === 0.U, loop_requesting_ldB.b_addr_end, (loop_requesting_ldB.b_ex_spad_id) * (max_addr / concurrent_loops).U)
   ldB.io.req.bits.loop_id := loop_requesting_ldB_id
   ldB.io.req.bits.is_resadd := is_resadd
+  ldB.io.req.bits.is_exact_resadd := is_exact_resadd
 
   ldB.io.req.valid := !loop_requesting_ldB.ldb_started && loop_requesting_ldB.configured
 

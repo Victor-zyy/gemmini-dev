@@ -106,6 +106,11 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   io.dma.req.bits.block_stride := block_stride
   io.dma.req.bits.scale := scale
   io.dma.req.bits.has_acc_bitwidth := localaddr_plus_row_counter.is_acc_addr && !shrink
+  // LOOP_WS exact ResAdd marks a normally-unused LocalAddr metadata bit.
+  // Convert it into an explicit DMA tag here; no address bit is changed.
+  io.dma.req.bits.exact_resadd := (if (localaddr_plus_row_counter.garbage.getWidth > 0)
+    config.has_exact_resadd.B && localaddr_plus_row_counter.garbage(0)
+  else false.B)
   io.dma.req.bits.all_zeros := all_zeros
   io.dma.req.bits.status := mstatus
   io.dma.req.bits.pixel_repeats := pixel_repeat

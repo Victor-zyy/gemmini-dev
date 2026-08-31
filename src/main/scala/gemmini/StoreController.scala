@@ -139,7 +139,8 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   val pool_vaddr = vaddr + (porow_counter * pool_out_dim + pocol_counter) * stride // TODO get rid of these multiplications
 
   val DoConfig = cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_STORE
-  val DoConfigNorm = (config.has_normalizations || config.has_silu_lut).B &&
+  val DoConfigNorm = (config.has_normalizations || config.has_silu_lut ||
+    config.has_exact_resadd).B &&
     cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM
   val DoStore = !DoConfig && !DoConfigNorm
 

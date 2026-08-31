@@ -10,6 +10,9 @@ object Activation {
   val IGELU = 3.U
   val SOFTMAX = 4.U
   val SILU = 5.U
+  // Exact YOLO residual writeback: identity except that the signed INT8
+  // minimum is -127 rather than the architectural -128.
+  val EXACT_RESADD = 6.U
 
   val bitwidth = 3
 }

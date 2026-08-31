@@ -22,6 +22,7 @@ class StreamReadRequest[U <: Data](spad_rows: Int, acc_rows: Int, mvin_scale_t_b
   val is_acc = Bool()
   val accumulate = Bool()
   val has_acc_bitwidth = Bool()
+  val exact_resadd = Bool()
   val scale = UInt(mvin_scale_t_bits.W)
   val status = new MStatus
   val len = UInt(16.W) // TODO magic number
@@ -40,6 +41,7 @@ class StreamReadResponse[U <: Data](spadWidth: Int, accWidth: Int, spad_rows: In
   val is_acc = Bool()
   val accumulate = Bool()
   val has_acc_bitwidth = Bool()
+  val exact_resadd = Bool()
   val scale = UInt(mvin_scale_t_bits.W)
   val repeats = UInt(16.W) // TODO magic number
   val pixel_repeats = UInt(16.W) // TODO magic number
@@ -99,6 +101,7 @@ class StreamReader[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T
     io.resp.bits.is_acc := beatPacker.io.out.bits.is_acc
     io.resp.bits.accumulate := beatPacker.io.out.bits.accumulate
     io.resp.bits.has_acc_bitwidth := beatPacker.io.out.bits.has_acc_bitwidth
+    io.resp.bits.exact_resadd := beatPacker.io.out.bits.exact_resadd
     io.resp.bits.scale := RegEnable(xactTracker.io.peek.entry.scale, beatPacker.io.req.fire)
     io.resp.bits.repeats := RegEnable(xactTracker.io.peek.entry.repeats, beatPacker.io.req.fire)
     io.resp.bits.pixel_repeats := RegEnable(xactTracker.io.peek.entry.pixel_repeats, beatPacker.io.req.fire)
@@ -255,6 +258,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     io.reserve.entry.is_acc := req.is_acc
     io.reserve.entry.accumulate := req.accumulate
     io.reserve.entry.has_acc_bitwidth := req.has_acc_bitwidth
+    io.reserve.entry.exact_resadd := req.exact_resadd
     io.reserve.entry.scale := req.scale
     io.reserve.entry.repeats := req.repeats
     io.reserve.entry.pixel_repeats := req.pixel_repeats

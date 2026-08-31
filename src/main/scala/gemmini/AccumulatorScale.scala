@@ -44,8 +44,9 @@ class AccumulatorScaleTaggedResp[T <: Data: Arithmetic](
   * Software fences before replacing the table, so LUT writes never need to
   * backpressure or observe the accumulator/LoopConv pipelines.
   */
-class AccumulatorSiluPostProcess[T <: Data: Arithmetic](
-  fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]]) extends Module {
+class AccumulatorPostProcess[T <: Data: Arithmetic](
+  fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]],
+  hasSiluLut: Boolean, hasExactResadd: Boolean) extends Module {
   val io = IO(new Bundle {
     val in = Input(new AccumulatorScaleTaggedResp[T](fullDataType, rDataType))
     val out = Output(new AccumulatorScaleResp[T](fullDataType, rDataType))
@@ -60,21 +61,26 @@ class AccumulatorSiluPostProcess[T <: Data: Arithmetic](
   // One logical read port per INT8 output lane. Synthesis can implement these
   // shallow memories as replicated LUTRAM instead of a high-fanout register
   // table and a large distributed mux network.
-  val laneLuts = Seq.fill(nLanes)(Mem(SiLULut.chunks, UInt(chunkWidth.W)))
-  when (io.lut_write.fire) {
-    laneLuts.foreach(_.write(io.lut_write.bits.chunk, io.lut_write.bits.data))
+  val laneLuts = if (hasSiluLut)
+    Some(Seq.fill(nLanes)(Mem(SiLULut.chunks, UInt(chunkWidth.W))))
+  else None
+  laneLuts.foreach { luts =>
+    when (io.lut_write.fire) {
+      luts.foreach(_.write(io.lut_write.bits.chunk, io.lut_write.bits.data))
+    }
   }
   io.lut_write.ready := true.B
 
   io.out := io.in.resp
   val useSilu = io.in.act === Activation.SILU
+  val useExactResadd = io.in.act === Activation.EXACT_RESADD
 
   for (row <- 0 until nRows; col <- 0 until nCols) {
     val lane = row * nCols + col
     val qMid = io.in.resp.data(row)(col)
     val qIndex = qMid.asUInt
     val chunkAddress = Mux(useSilu, qIndex(7, 3), 0.U)
-    val chunk = laneLuts(lane).read(chunkAddress)
+    val chunk = laneLuts.map(_(lane).read(chunkAddress)).getOrElse(0.U(chunkWidth.W))
     val entries = VecInit.tabulate(SiLULut.entriesPerWrite) { lane =>
       val hi = (lane + 1) * SiLULut.entryBits - 1
       val lo = lane * SiLULut.entryBits
@@ -82,7 +88,12 @@ class AccumulatorSiluPostProcess[T <: Data: Arithmetic](
     }
     val lutValue = entries(qIndex(2, 0))
     val signedValue = lutValue.asSInt.pad(qMid.getWidth).asTypeOf(qMid)
-    io.out.data(row)(col) := Mux(useSilu, signedValue, qMid)
+    val siluValue = Mux(hasSiluLut.B && useSilu, signedValue, qMid)
+    val exactValue = Mux(qMid.asUInt ===
+      (BigInt(1) << (qMid.getWidth - 1)).U(qMid.getWidth.W),
+      (-127).S(qMid.getWidth.W).asTypeOf(qMid), qMid)
+    io.out.data(row)(col) := Mux(hasExactResadd.B && useExactResadd,
+      exactValue, siluValue)
   }
 }
 
@@ -155,7 +166,7 @@ class AccumulatorScale[T <: Data, U <: Data](
   num_scale_units: Int,
   latency: Int,
   has_nonlinear_activations: Boolean, has_normalizations: Boolean,
-  has_silu_lut: Boolean)(implicit ev: Arithmetic[T]) extends Module {
+  has_silu_lut: Boolean, has_exact_resadd: Boolean)(implicit ev: Arithmetic[T]) extends Module {
 
   import ev._
 
@@ -427,19 +438,20 @@ class AccumulatorScale[T <: Data, U <: Data](
     }
   }
 
-  if (has_silu_lut) {
-    val siluPost = Module(new AccumulatorSiluPostProcess(fullDataType, rDataType))
-    siluPost.io.in.resp := out.bits
-    siluPost.io.in.act := outAct
-    siluPost.io.lut_write.valid := io.silu_lut_write.valid
-    siluPost.io.lut_write.bits := io.silu_lut_write.bits
-    io.silu_lut_write.ready := siluPost.io.lut_write.ready
+  if (has_silu_lut || has_exact_resadd) {
+    val post = Module(new AccumulatorPostProcess(
+      fullDataType, rDataType, has_silu_lut, has_exact_resadd))
+    post.io.in.resp := out.bits
+    post.io.in.act := outAct
+    post.io.lut_write.valid := io.silu_lut_write.valid
+    post.io.lut_write.bits := io.silu_lut_write.bits
+    io.silu_lut_write.ready := post.io.lut_write.ready
 
     // Preserve the pre-SiLU ready/valid path exactly. The sidecar changes only
     // the response data bits when this transaction is tagged as SILU.
     io.out.valid := out.valid
     out.ready := io.out.ready
-    io.out.bits := siluPost.io.out
+    io.out.bits := post.io.out
   } else {
     io.silu_lut_write.ready := true.B
     io.out <> out

@@ -18,6 +18,7 @@ class ScratchpadMemReadRequest[U <: Data](local_addr_t: LocalAddr, scale_t_bits:
   val repeats = UInt(16.W) // TODO don't use a magic number for the width here
   val scale = UInt(scale_t_bits.W)
   val has_acc_bitwidth = Bool()
+  val exact_resadd = Bool()
   val all_zeros = Bool()
   val block_stride = UInt(16.W) // TODO magic numbers
   val pixel_repeats = UInt(8.W) // TODO magic numbers
@@ -401,6 +402,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     reader.module.io.req.bits.is_acc := read_issue_q.io.deq.bits.laddr.is_acc_addr
     reader.module.io.req.bits.accumulate := read_issue_q.io.deq.bits.laddr.accumulate
     reader.module.io.req.bits.has_acc_bitwidth := read_issue_q.io.deq.bits.has_acc_bitwidth
+    reader.module.io.req.bits.exact_resadd := read_issue_q.io.deq.bits.exact_resadd
     reader.module.io.req.bits.block_stride := read_issue_q.io.deq.bits.block_stride
     reader.module.io.req.bits.status := read_issue_q.io.deq.bits.status
     reader.module.io.req.bits.cmd_id := read_issue_q.io.deq.bits.cmd_id
@@ -418,8 +420,35 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       )
     )
 
+    // The exact ResAdd path consumes the same DMA response as legacy mvin,
+    // but preserves the fixed-point result at accumulator width. With the
+    // feature disabled, exact_resadd is a constant false and synthesis drops
+    // this side path completely.
+    val exact_resadd_scale = Module(new ExactResaddScaler(
+      block_cols, inputType.getWidth, accType.getWidth,
+      chiselTypeOf(reader.module.io.resp.bits)))
+    exact_resadd_scale.io.req.valid := reader.module.io.resp.valid &&
+      reader.module.io.resp.bits.exact_resadd
+    exact_resadd_scale.io.req.bits.in :=
+      reader.module.io.resp.bits.data.asTypeOf(
+        chiselTypeOf(exact_resadd_scale.io.req.bits.in))
+    exact_resadd_scale.io.req.bits.scale := reader.module.io.resp.bits.scale
+    exact_resadd_scale.io.req.bits.last := reader.module.io.resp.bits.last
+    exact_resadd_scale.io.req.bits.tag := reader.module.io.resp.bits
+    exact_resadd_scale.io.resp.ready := false.B
+
+    when (reader.module.io.resp.valid && reader.module.io.resp.bits.exact_resadd) {
+      assert(reader.module.io.resp.bits.is_acc &&
+        !reader.module.io.resp.bits.has_acc_bitwidth,
+        "Exact ResAdd accepts only shrunk INT8 loads into the accumulator")
+      assert(reader.module.io.resp.bits.repeats === 0.U &&
+        reader.module.io.resp.bits.pixel_repeats === 1.U,
+        "Exact ResAdd does not support DMA row or pixel repetition")
+    }
+
     mvin_scale_in.valid := reader.module.io.resp.valid && (mvin_scale_shared.B || !reader.module.io.resp.bits.is_acc ||
-      (reader.module.io.resp.bits.is_acc && !reader.module.io.resp.bits.has_acc_bitwidth))
+      (reader.module.io.resp.bits.is_acc && !reader.module.io.resp.bits.has_acc_bitwidth)) &&
+      !reader.module.io.resp.bits.exact_resadd
 
     mvin_scale_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_in.bits.in))
     mvin_scale_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_t)
@@ -443,7 +472,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
     if (!mvin_scale_shared) {
       mvin_scale_acc_in.valid := reader.module.io.resp.valid &&
-        (reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth)
+        (reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth) &&
+        !reader.module.io.resp.bits.exact_resadd
       mvin_scale_acc_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_acc_in.bits.in))
       mvin_scale_acc_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_acc_t)
       mvin_scale_acc_in.bits.repeats := reader.module.io.resp.bits.repeats
@@ -454,11 +484,15 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       mvin_scale_acc_out.ready := false.B
     }
 
-    reader.module.io.resp.ready := Mux(reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth,
-      mvin_scale_acc_in.ready, mvin_scale_in.ready)
+    reader.module.io.resp.ready := Mux(reader.module.io.resp.bits.exact_resadd,
+      exact_resadd_scale.io.req.ready,
+      Mux(reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth,
+        mvin_scale_acc_in.ready, mvin_scale_in.ready))
 
     val mvin_scale_finished = mvin_scale_pixel_repeater.io.resp.fire && mvin_scale_pixel_repeater.io.resp.bits.last
     val mvin_scale_acc_finished = mvin_scale_acc_out.fire && mvin_scale_acc_out.bits.last
+    val exact_resadd_finished = exact_resadd_scale.io.resp.fire &&
+      exact_resadd_scale.io.resp.bits.last
     val zero_writer_finished = zero_writer_pixel_repeater.io.resp.fire && zero_writer_pixel_repeater.io.resp.bits.last
 
     val zero_writer_bytes_read = Mux(zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr,
@@ -466,18 +500,21 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       zero_writer_pixel_repeater.io.resp.bits.tag.cols * (inputType.getWidth / 8).U)
 
     // For DMA read responses, mvin_scale gets first priority, then mvin_scale_acc, and then zero_writer
-    io.dma.read.resp.valid := mvin_scale_finished || mvin_scale_acc_finished || zero_writer_finished
+    io.dma.read.resp.valid := mvin_scale_finished || mvin_scale_acc_finished ||
+      exact_resadd_finished || zero_writer_finished
 
     // io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer.io.resp.bits.tag.cmd_id, Seq(
     io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer_pixel_repeater.io.resp.bits.tag.cmd_id, Seq(
       // mvin_scale_finished -> mvin_scale_out.bits.tag.cmd_id,
       mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.cmd_id,
-      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.cmd_id))
+      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.cmd_id,
+      exact_resadd_finished -> exact_resadd_scale.io.resp.bits.tag.cmd_id))
 
     io.dma.read.resp.bits.bytesRead := MuxCase(zero_writer_bytes_read, Seq(
       // mvin_scale_finished -> mvin_scale_out.bits.tag.bytes_read,
       mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.bytes_read,
-      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read))
+      mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read,
+      exact_resadd_finished -> exact_resadd_scale.io.resp.bits.tag.bytes_read))
 
     io.tlb(0) <> writer.module.io.tlb
     io.tlb(1) <> reader.module.io.tlb
@@ -645,6 +682,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       has_nonlinear_activations,
       has_normalizations,
       has_silu_lut,
+      has_exact_resadd,
     ))
 
     val acc_waiting_to_be_scaled = write_scale_q.io.deq.valid &&
@@ -783,8 +821,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
       // Writing to the accumulator banks
       bank_ios.zipWithIndex.foreach { case (bio, i) =>
-        // Order of precedence during writes is ExecuteController, and then mvin_scale, and then mvin_scale_acc, and
-        // then zero_writer
+        // Order of precedence during writes is ExecuteController, exact
+        // ResAdd, mvin_scale, mvin_scale_acc, then zero_writer.
 
         val exwrite = io.acc.write(i).valid
         io.acc.write(i).ready := true.B
@@ -793,20 +831,29 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // val from_mvin_scale = mvin_scale_out.valid && mvin_scale_out.bits.tag.is_acc
         val from_mvin_scale = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
         val from_mvin_scale_acc = mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.tag.is_acc
+        val from_exact_resadd = exact_resadd_scale.io.resp.valid &&
+          exact_resadd_scale.io.resp.bits.tag.is_acc
 
         // val mvin_scale_laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
         val mvin_scale_laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
         val mvin_scale_acc_laddr = mvin_scale_acc_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_acc_out.bits.row
+        val exact_resadd_laddr =
+          exact_resadd_scale.io.resp.bits.tag.addr.asTypeOf(local_addr_t)
 
-        val dmaread_bank = Mux(from_mvin_scale, mvin_scale_laddr.acc_bank(),
-          mvin_scale_acc_laddr.acc_bank())
-        val dmaread_row = Mux(from_mvin_scale, mvin_scale_laddr.acc_row(), mvin_scale_acc_laddr.acc_row())
+        val dmaread_bank = Mux(from_exact_resadd,
+          exact_resadd_laddr.acc_bank(),
+          Mux(from_mvin_scale, mvin_scale_laddr.acc_bank(),
+            mvin_scale_acc_laddr.acc_bank()))
+        val dmaread_row = Mux(from_exact_resadd,
+          exact_resadd_laddr.acc_row(),
+          Mux(from_mvin_scale, mvin_scale_laddr.acc_row(),
+            mvin_scale_acc_laddr.acc_row()))
 
         // We need to make sure that we don't try to return a dma read resp from both mvin_scale and mvin_scale_acc
         // at the same time. mvin_scale always gets priority in this cases
         val spad_last = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
 
-        val dmaread = (from_mvin_scale || from_mvin_scale_acc) &&
+        val dmaread = (from_exact_resadd || from_mvin_scale || from_mvin_scale_acc) &&
           dmaread_bank === i.U /* &&
           (mvin_scale_same.B || from_mvin_scale || !spad_dmaread_last) */
 
@@ -817,7 +864,9 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         val zerowrite = zero_writer_pixel_repeater.io.resp.valid && zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr &&
           zero_writer_pixel_repeater.io.resp.bits.laddr.acc_bank() === i.U &&
           // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
-          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) ||
+            (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last) ||
+            (exact_resadd_scale.io.resp.valid && exact_resadd_scale.io.resp.bits.last))
 
         val consecutive_write_block = RegInit(false.B)
         if (acc_singleported) {
@@ -837,6 +886,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
         bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
           Seq(exwrite -> io.acc.write(i).bits.acc,
+            from_exact_resadd -> exact_resadd_scale.io.resp.bits.tag.accumulate,
             // from_mvin_scale -> mvin_scale_out.bits.tag.accumulate,
             from_mvin_scale -> mvin_scale_pixel_repeater.io.resp.bits.tag.accumulate,
             from_mvin_scale_acc -> mvin_scale_acc_out.bits.tag.accumulate))
@@ -844,7 +894,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // bio.write.bits.addr := MuxCase(zero_writer.io.resp.bits.laddr.acc_row(),
         bio.write.bits.addr := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.acc_row(),
           Seq(exwrite -> io.acc.write(i).bits.addr,
-            (from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
+            (from_exact_resadd || from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
 
         when (exwrite) {
           bio.write.valid := true.B
@@ -852,12 +902,21 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.bits.mask := io.acc.write(i).bits.mask
         }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
           bio.write.valid := true.B
-          bio.write.bits.data := Mux(from_mvin_scale,
-            // VecInit(mvin_scale_out.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
-            VecInit(mvin_scale_pixel_repeater.io.resp.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
-            mvin_scale_acc_out.bits.out.asTypeOf(acc_row_t))
-          bio.write.bits.mask :=
+          bio.write.bits.data := Mux(from_exact_resadd,
+            exact_resadd_scale.io.resp.bits.out.asTypeOf(acc_row_t),
             Mux(from_mvin_scale,
+              // VecInit(mvin_scale_out.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+              VecInit(mvin_scale_pixel_repeater.io.resp.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+              mvin_scale_acc_out.bits.out.asTypeOf(acc_row_t)))
+          bio.write.bits.mask :=
+            Mux(from_exact_resadd,
+              {
+                val n = accType.getWidth / inputType.getWidth
+                val mask = exact_resadd_scale.io.resp.bits.tag.mask take
+                  ((spad_w / (aligned_to * 8)) max 1)
+                VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+              },
+              Mux(from_mvin_scale,
               {
                 val n = accType.getWidth / inputType.getWidth
                 // val mask = mvin_scale_out.bits.tag.mask take ((spad_w / (aligned_to * 8)) max 1)
@@ -865,9 +924,11 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
                 val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
                 expanded
               },
-              mvin_scale_acc_out.bits.tag.mask)
+              mvin_scale_acc_out.bits.tag.mask))
 
-          when(from_mvin_scale) {
+          when(from_exact_resadd) {
+            exact_resadd_scale.io.resp.ready := bio.write.ready
+          }.elsewhen(from_mvin_scale) {
             mvin_scale_pixel_repeater.io.resp.ready := bio.write.ready
           }.otherwise {
             mvin_scale_acc_out.ready := bio.write.ready
