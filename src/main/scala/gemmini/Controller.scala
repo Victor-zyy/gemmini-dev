@@ -171,7 +171,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
-  val tlb = Module(new FrontendTLB(if (outer.config.use_tl_ext_mem) 3 else 2,
+  val tlb = Module(new FrontendTLB(
+    (if (outer.config.use_tl_ext_mem) 3 else 2) +
+      (if (outer.config.has_exact_gather) 2 else 0),
     tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
   (tlb.io.clients zip outer.spad.module.io.tlb).foreach(t => t._1 <> t._2)
 
@@ -244,11 +246,22 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   val raw_cmd = raw_cmd_q.io.deq
 
+  // Exact Gather consumes only its own funct 26--29 commands. It drives a
+  // dedicated read/scale/write DMA path and never allocates accumulator rows
+  // or reservation-station entries.
+  val exact_gather = if (has_exact_gather) Some(withClock (gated_clock) {
+    ExactGather(raw_cmd, meshColumns * tileColumns, coreMaxAddrBits,
+      reservation_station_entries, mvin_scale_t_bits)
+  }) else None
+  exact_gather.foreach(_.io.dma <> spad.module.io.exact_gather.get)
+  val gather_cmd = exact_gather.map(_.io.out).getOrElse(raw_cmd)
+  val exact_gather_busy = exact_gather.map(_.io.busy).getOrElse(false.B)
+
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
   val max_sts = reservation_station_entries_st
 
-  val (conv_cmd, loop_conv_unroller_busy) = if (has_loop_conv) withClock (gated_clock) { LoopConv(raw_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
+  val (conv_cmd, loop_conv_unroller_busy) = if (has_loop_conv) withClock (gated_clock) { LoopConv(gather_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes,
     new ConfigMvinRs1(mvin_scale_t_bits, block_stride_bits, pixel_repeats_bits), new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
@@ -257,9 +270,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs) }
-  else (raw_cmd, false.B)
+  else (gather_cmd, false.B)
 
-  val (loop_cmd, loop_matmul_unroller_busy, loop_completed) = withClock (gated_clock) { LoopMatmul(if (has_loop_conv) conv_cmd else raw_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+  val (loop_cmd, loop_matmul_unroller_busy, loop_completed) = withClock (gated_clock) { LoopMatmul(if (has_loop_conv) conv_cmd else gather_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
@@ -440,7 +453,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  io.busy := raw_cmd.valid || exact_gather_busy || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 

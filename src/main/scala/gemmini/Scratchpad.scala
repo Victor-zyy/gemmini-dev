@@ -216,6 +216,16 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   val spad_writer = Option.when(config.use_tl_ext_mem)(LazyModule(new StreamWriter(max_in_flight_mem_reqs, dataBits, maxBytes,
     if (acc_read_full_width) acc_w else spad_w, aligned_to, inputType, block_cols, use_tlb_register_filter,
     use_firesim_simulation_counters)))
+  // Exact Gather owns a private DMA pair. Its data never enters the
+  // scratchpad or accumulator arrays, so it cannot alias row zero or consume
+  // reservation-station entries used by matmul/LoopConv.
+  val exact_gather_reader = Option.when(config.has_exact_gather)(LazyModule(new StreamReader(
+    config, max_in_flight_mem_reqs, dataBits, maxBytes, spad_w, spad_w,
+    aligned_to, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
+    1, use_tlb_register_filter, use_firesim_simulation_counters)))
+  val exact_gather_writer = Option.when(config.has_exact_gather)(LazyModule(new StreamWriter(
+    max_in_flight_mem_reqs, dataBits, maxBytes, spad_w, aligned_to, inputType,
+    block_cols, use_tlb_register_filter, use_firesim_simulation_counters)))
 
   // TODO make a cross-bar vs two separate ports a config option
   // id_node :=* reader.node
@@ -223,6 +233,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
   xbar_node := TLBuffer() := reader.node // TODO
   xbar_node := TLBuffer() := writer.node
+  exact_gather_reader.foreach(r => xbar_node := TLBuffer() := r.node)
+  exact_gather_writer.foreach(w => xbar_node := TLBuffer() := w.node)
   id_node := TLWidthWidget(config.dma_buswidth/8) := TLBuffer() := xbar_node
 
   lazy val module = new Impl
@@ -261,7 +273,12 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       }
 
       // TLB ports
-      val tlb = Vec(2 + spad_writer.map(_ => 1).getOrElse(0), new FrontendTLBIO)
+      val tlb = Vec(2 + spad_writer.map(_ => 1).getOrElse(0) +
+        (if (has_exact_gather) 2 else 0), new FrontendTLBIO)
+
+      // Present only in configurations which synthesize native Exact Gather.
+      val exact_gather = Option.when(has_exact_gather)(
+        Flipped(new ExactGatherDMAIO(coreMaxAddrBits, mvin_scale_t_bits)))
 
       // Misc. ports
       val busy = Output(Bool())
@@ -516,6 +533,161 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read,
       exact_resadd_finished -> exact_resadd_scale.io.resp.bits.tag.bytes_read))
 
+    // Native Exact Gather: bounded row fragments travel directly from a
+    // dedicated StreamReader through the exact fixed-point scaler into a
+    // dedicated StreamWriter. Transaction IDs retain per-fragment destination
+    // metadata while several reads and writes are in flight. No scratchpad or
+    // accumulator address is allocated.
+    if (has_exact_gather) {
+      val gather = io.exact_gather.get
+      val gatherReader = exact_gather_reader.get.module
+      val gatherWriter = exact_gather_writer.get.module
+
+      require(max_in_flight_mem_reqs > 1,
+        "Native Exact Gather requires at least two DMA transaction slots")
+      val slotBits = log2Ceil(max_in_flight_mem_reqs)
+
+      class NativeGatherMetadata extends Bundle {
+        val dst = UInt(coreMaxAddrBits.W)
+        val cols = UInt(16.W)
+        val scale = UInt(mvin_scale_t_bits.W)
+        val status = new MStatus
+      }
+
+      val gatherMetadata = Reg(Vec(max_in_flight_mem_reqs,
+        new NativeGatherMetadata))
+      val gatherData = Reg(Vec(max_in_flight_mem_reqs,
+        Vec(block_cols, inputType)))
+      val gatherReceived = RegInit(VecInit(Seq.fill(max_in_flight_mem_reqs)(
+        0.U(block_cols.W))))
+      val gatherInFlight = RegInit(0.U(max_in_flight_mem_reqs.W))
+      val freeSlotOH = PriorityEncoderOH(~gatherInFlight)
+      val freeSlot = OHToUInt(freeSlotOH)
+      val slotsAvailable = !gatherInFlight.andR
+
+      val gatherScale = Module(new ExactResaddScaler(
+        block_cols, inputType.getWidth, accType.getWidth,
+        UInt(slotBits.W)))
+
+      // StreamReader can retain max_in_flight_mem_reqs independent reads.
+      // Couple admission to a free metadata slot so every reordered response
+      // still carries the correct destination address.
+      gatherReader.io.req.valid := gather.req.valid && slotsAvailable
+      gather.req.ready := gatherReader.io.req.ready && slotsAvailable
+      gatherReader.io.req.bits.vaddr := gather.req.bits.src
+      gatherReader.io.req.bits.spaddr := 0.U
+      gatherReader.io.req.bits.is_acc := false.B
+      gatherReader.io.req.bits.accumulate := false.B
+      gatherReader.io.req.bits.has_acc_bitwidth := false.B
+      gatherReader.io.req.bits.exact_resadd := false.B
+      gatherReader.io.req.bits.scale := gather.req.bits.scale
+      gatherReader.io.req.bits.status := gather.req.bits.status
+      gatherReader.io.req.bits.len := gather.req.bits.cols
+      gatherReader.io.req.bits.repeats := 0.U
+      gatherReader.io.req.bits.pixel_repeats := 1.U
+      gatherReader.io.req.bits.block_stride := 1.U
+      gatherReader.io.req.bits.cmd_id := freeSlot
+
+      when (gather.req.fire) {
+        assert(gather.req.bits.cols =/= 0.U &&
+          gather.req.bits.cols <= block_cols.U,
+          "Native Exact Gather fragment must fit one array row")
+        gatherMetadata(freeSlot).dst := gather.req.bits.dst
+        gatherMetadata(freeSlot).cols := gather.req.bits.cols
+        gatherMetadata(freeSlot).scale := gather.req.bits.scale
+        gatherMetadata(freeSlot).status := gather.req.bits.status
+        gatherReceived(freeSlot) := 0.U
+      }
+
+      val responseSlot = gatherReader.io.resp.bits.cmd_id(slotBits - 1, 0)
+      val responseData = gatherReader.io.resp.bits.data.asTypeOf(
+        Vec(block_cols, inputType))
+      val responseByteMask = VecInit(
+        gatherReader.io.resp.bits.mask.flatMap(bit =>
+          Seq.fill(aligned_to)(bit)).take(block_cols)).asUInt
+      val combinedResponseMask = gatherReceived(responseSlot) |
+        responseByteMask
+      val requiredResponseMaskWide = (1.U((block_cols + 1).W) <<
+        gatherMetadata(responseSlot).cols) - 1.U
+      val requiredResponseMask =
+        requiredResponseMaskWide(block_cols - 1, 0)
+      val responseCompletesFragment =
+        (combinedResponseMask & requiredResponseMask) === requiredResponseMask
+
+      // A source fragment may cross an alignment or TileLink request
+      // boundary. Accumulate all partial response bytes under the same command
+      // ID and enqueue the slot only when its complete logical byte mask has
+      // arrived.
+      val completedGatherSlots = Module(new Queue(UInt(slotBits.W),
+        max_in_flight_mem_reqs, pipe = true))
+      completedGatherSlots.io.enq.valid := gatherReader.io.resp.valid &&
+        responseCompletesFragment
+      completedGatherSlots.io.enq.bits := responseSlot
+      gatherReader.io.resp.ready := !responseCompletesFragment ||
+        completedGatherSlots.io.enq.ready
+
+      when (gatherReader.io.resp.fire) {
+        assert(gatherInFlight(responseSlot),
+          "Native Exact Gather read response has no live metadata slot")
+        gatherReceived(responseSlot) := combinedResponseMask
+        for (lane <- 0 until block_cols) {
+          when (responseByteMask(lane)) {
+            gatherData(responseSlot)(lane) := responseData(lane)
+          }
+        }
+      }
+
+      val scaleSlot = completedGatherSlots.io.deq.bits
+      gatherScale.io.req.valid := completedGatherSlots.io.deq.valid
+      gatherScale.io.req.bits.in := gatherData(scaleSlot)
+      gatherScale.io.req.bits.scale := gatherMetadata(scaleSlot).scale
+      gatherScale.io.req.bits.last := true.B
+      gatherScale.io.req.bits.tag := scaleSlot
+      completedGatherSlots.io.deq.ready := gatherScale.io.req.ready
+
+      val saturatedGatherData = VecInit(gatherScale.io.resp.bits.out.map {
+        value =>
+          val clamped = Mux(value > 127.S, 127.S,
+            Mux(value < (-127).S, (-127).S, value))
+          val clampedBits = clamped.asUInt
+          clampedBits(inputType.getWidth - 1, 0)
+      }).asUInt
+
+      val writeSlot = gatherScale.io.resp.bits.tag
+      val writeMetadata = gatherMetadata(writeSlot)
+      gatherWriter.io.req.valid := gatherScale.io.resp.valid
+      gatherWriter.io.req.bits.vaddr := writeMetadata.dst
+      gatherWriter.io.req.bits.physical := false.B
+      gatherWriter.io.req.bits.data := saturatedGatherData
+      gatherWriter.io.req.bits.len :=
+        writeMetadata.cols * (inputType.getWidth / 8).U
+      gatherWriter.io.req.bits.block := 0.U
+      gatherWriter.io.req.bits.status := writeMetadata.status
+      gatherWriter.io.req.bits.pool_en := false.B
+      gatherWriter.io.req.bits.store_en := true.B
+      gatherScale.io.resp.ready := gatherWriter.io.req.ready
+
+      when (gatherWriter.io.req.fire) {
+        assert(gatherScale.io.resp.bits.last,
+          "Native Exact Gather emitted more than one scaled row")
+        assert(gatherInFlight(writeSlot),
+          "Native Exact Gather write has no live metadata slot")
+      }
+
+      val allocatedSlots = Mux(gather.req.fire,
+        UIntToOH(freeSlot, max_in_flight_mem_reqs), 0.U)
+      val retiredSlots = Mux(gatherWriter.io.req.fire,
+        UIntToOH(writeSlot, max_in_flight_mem_reqs), 0.U)
+      gatherInFlight := (gatherInFlight | allocatedSlots) &
+        ~retiredSlots.asUInt
+
+      val gatherActive = gatherInFlight.orR || gatherReader.io.busy ||
+        gatherScale.io.resp.valid || gatherWriter.io.busy
+      val gatherWasActive = RegNext(gatherActive, false.B)
+      gather.busy := gatherActive
+      gather.completed := gatherWasActive && !gatherActive
+    }
+
     io.tlb(0) <> writer.module.io.tlb
     io.tlb(1) <> reader.module.io.tlb
     spad_writer match {
@@ -529,7 +701,20 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     writer.module.io.flush := io.flush
     reader.module.io.flush := io.flush
 
+    val exactGatherTlbBase = 2 + spad_writer.map(_ => 1).getOrElse(0)
+    exact_gather_reader.foreach { gatherReader =>
+      io.tlb(exactGatherTlbBase) <> gatherReader.module.io.tlb
+      gatherReader.module.io.flush := io.flush
+    }
+    exact_gather_writer.foreach { gatherWriter =>
+      io.tlb(exactGatherTlbBase + 1) <> gatherWriter.module.io.tlb
+      gatherWriter.module.io.flush := io.flush
+    }
+
     io.busy := writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
+      exact_gather_reader.map(_.module.io.busy).getOrElse(false.B) ||
+      exact_gather_writer.map(_.module.io.busy).getOrElse(false.B) ||
+      io.exact_gather.map(_.busy).getOrElse(false.B) ||
       write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
 
     val spad_mems = {
@@ -957,6 +1142,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     io.counter.collect(reader.module.io.counter)
     io.counter.collect(writer.module.io.counter)
     spad_writer.foreach(_.module.io.counter := DontCare)
+    exact_gather_reader.foreach(_.module.io.counter := DontCare)
+    exact_gather_writer.foreach(_.module.io.counter := DontCare)
 //    io.counter.collect(spad_writer.module.io.counter)
   }
 }

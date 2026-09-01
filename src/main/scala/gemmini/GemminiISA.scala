@@ -38,6 +38,14 @@ object GemminiISA {
   val LOOP_WS_CONFIG_SPAD_AB = 24.U
   val LOOP_WS_CONFIG_SPAD_C = 25.U
 
+  // Exact Gather-Requant command family. Configuration commands are retained
+  // in a small frontend register file; EXACT_GATHER expands the configured
+  // operation into ordinary Gemmini DMA load/store commands.
+  val EXACT_GATHER_CONFIG_BOUNDS = 26.U
+  val EXACT_GATHER_CONFIG_BRANCH = 27.U
+  val EXACT_GATHER_CONFIG_SCALE = 28.U
+  val EXACT_GATHER = 29.U
+
   // rs1[2:0] values
   val CONFIG_EX = 0.U
   val CONFIG_LOAD = 1.U

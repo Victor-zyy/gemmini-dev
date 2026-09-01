@@ -94,6 +94,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_nonlinear_activations: Boolean = true,
                                                                              has_silu_lut: Boolean = false,
                                                                              has_exact_resadd: Boolean = false,
+                                                                             has_exact_gather: Boolean = false,
                                                                              has_dw_convs: Boolean = true,
                                                                              has_normalizations: Boolean = false,
                                                                              has_first_layer_optimizations: Boolean = true,
@@ -119,6 +120,8 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     inputType.isInstanceOf[SInt] && inputType.getWidth == 8 &&
     accType.isInstanceOf[SInt] && accType.getWidth >= 32),
     "Exact ResAdd requires signed INT8 elements, a signed >=32-bit accumulator, and nonlinear activations")
+  require(!has_exact_gather || has_exact_resadd,
+    "Exact Gather requires the Exact ResAdd fixed-point load/store datapath")
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
@@ -526,6 +529,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
     if (has_exact_resadd) {
       header ++= "#define HAS_EXACT_RESADD\n\n"
+    }
+
+    if (has_exact_gather) {
+      header ++= "#define HAS_EXACT_GATHER\n\n"
     }
 
     header ++= s"#endif // $guard\n"
