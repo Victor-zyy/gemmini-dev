@@ -95,6 +95,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_silu_lut: Boolean = false,
                                                                              has_exact_resadd: Boolean = false,
                                                                              has_exact_gather: Boolean = false,
+                                                                             has_layer_matmul: Boolean = false,
                                                                              has_dw_convs: Boolean = true,
                                                                              has_normalizations: Boolean = false,
                                                                              has_first_layer_optimizations: Boolean = true,
@@ -533,6 +534,9 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
     if (has_exact_gather) {
       header ++= "#define HAS_EXACT_GATHER\n\n"
+    }
+    if (has_layer_matmul) {
+      header ++= "#define HAS_LAYER_MATMUL\n\n"
     }
 
     header ++= s"#endif // $guard\n"

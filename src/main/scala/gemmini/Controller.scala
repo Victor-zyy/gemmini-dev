@@ -256,12 +256,20 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   exact_gather.foreach(_.io.dma <> spad.module.io.exact_gather.get)
   val gather_cmd = exact_gather.map(_.io.out).getOrElse(raw_cmd)
   val exact_gather_busy = exact_gather.map(_.io.busy).getOrElse(false.B)
+  val layer_matmul = if (has_layer_matmul) Some(withClock(gated_clock) {
+    require(inputType.getWidth == 8 && accType.getWidth == 32)
+    Module(new LayerMatmul(meshRows * tileRows, reservation_station_entries,
+      sp_banks * sp_bank_entries, acc_banks * acc_bank_entries))
+  }) else None
+  layer_matmul.foreach(_.io.in <> gather_cmd)
+  val layer_cmd = layer_matmul.map(_.io.out).getOrElse(gather_cmd)
+  val layer_busy = layer_matmul.map(_.io.busy).getOrElse(false.B)
 
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
   val max_sts = reservation_station_entries_st
 
-  val (conv_cmd, loop_conv_unroller_busy) = if (has_loop_conv) withClock (gated_clock) { LoopConv(gather_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
+  val (conv_cmd, loop_conv_unroller_busy) = if (has_loop_conv) withClock (gated_clock) { LoopConv(layer_cmd, reservation_station.io.conv_ld_completed, reservation_station.io.conv_st_completed, reservation_station.io.conv_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes,
     new ConfigMvinRs1(mvin_scale_t_bits, block_stride_bits, pixel_repeats_bits), new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
@@ -270,9 +278,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs) }
-  else (gather_cmd, false.B)
+  else (layer_cmd, false.B)
 
-  val (loop_cmd, loop_matmul_unroller_busy, loop_completed) = withClock (gated_clock) { LoopMatmul(if (has_loop_conv) conv_cmd else gather_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+  val (loop_cmd, loop_matmul_unroller_busy, loop_completed) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
@@ -453,7 +461,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || exact_gather_busy || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  val layer_downstream_idle = !(loop_conv_unroller_busy || loop_matmul_unroller_busy ||
+    reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid ||
+    loop_cmd.valid || conv_cmd.valid || load_controller.io.busy ||
+    store_controller.io.busy || ex_controller.io.busy)
+  layer_matmul.foreach(_.io.downstreamIdle := layer_downstream_idle)
+  io.busy := raw_cmd.valid || exact_gather_busy || layer_busy || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  if (has_layer_matmul) {
+    // A command already accepted into the frontend must remain visible to
+    // the CPU fence even when it is consumed before reaching LoopMatmul.
+    when (gather_cmd.valid) {
+      assert(io.busy, "LayerMatmul frontend command lost from RoCC busy")
+    }
+  }
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 
