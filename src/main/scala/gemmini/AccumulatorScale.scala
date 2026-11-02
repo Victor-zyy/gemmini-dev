@@ -166,7 +166,8 @@ class AccumulatorScale[T <: Data, U <: Data](
   num_scale_units: Int,
   latency: Int,
   has_nonlinear_activations: Boolean, has_normalizations: Boolean,
-  has_silu_lut: Boolean, has_exact_resadd: Boolean)(implicit ev: Arithmetic[T]) extends Module {
+  has_silu_lut: Boolean, has_exact_resadd: Boolean,
+  fp32_pipeline: Boolean = false)(implicit ev: Arithmetic[T]) extends Module {
 
   import ev._
 
@@ -180,7 +181,27 @@ class AccumulatorScale[T <: Data, U <: Data](
     fullDataType, rDataType)(ev)))
   val outAct = Wire(UInt(Activation.bitwidth.W))
 
-  if (num_scale_units == -1) {
+  if (fp32_pipeline) {
+    require(t.isInstanceOf[SInt] && t.getWidth == 32 &&
+      rDataType.head.head.isInstanceOf[SInt] && rDataType.head.head.getWidth == 8,
+      "FP32 scale pipeline requires INT32 accumulators and INT8 output")
+    require(scale_t.isInstanceOf[Float] &&
+      scale_t.asInstanceOf[Float].expWidth == 8 &&
+      scale_t.asInstanceOf[Float].sigWidth == 24 &&
+      !scale_t.asInstanceOf[Float].isRecoded,
+      "FP32 scale pipeline requires IEEE FP32 scale factors")
+    require(num_scale_units == -1 && latency == 8 && !has_normalizations,
+      "FP32 scale pipeline replaces only the default parallel eight-cycle scaler without normalizations")
+    val pipe = Module(new AccumulatorScaleFP32Pipeline(
+      fullDataType.size, fullDataType.head.size, has_nonlinear_activations))
+    pipe.io.in.valid := io.in.valid
+    pipe.io.in.bits := io.in.bits.asTypeOf(pipe.io.in.bits)
+    io.in.ready := pipe.io.in.ready
+    out.valid := pipe.io.out.valid
+    pipe.io.out.ready := out.ready
+    out.bits := pipe.io.out.bits.resp.asTypeOf(out.bits)
+    outAct := pipe.io.out.bits.act
+  } else if (num_scale_units == -1) {
     val data = io.in.bits.acc_read_resp.data
     val act = io.in.bits.acc_read_resp.act
     val igelu_qb = io.in.bits.acc_read_resp.igelu_qb

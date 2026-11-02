@@ -868,6 +868,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       has_normalizations,
       has_silu_lut,
       has_exact_resadd,
+      acc_scale_fp32_pipeline,
     ))
 
     val acc_waiting_to_be_scaled = write_scale_q.io.deq.valid &&
