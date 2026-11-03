@@ -231,7 +231,13 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   // id_node :=* reader.node
   // id_node :=* writer.node
 
-  xbar_node := TLBuffer() := reader.node // TODO
+  if (p(GemminiOrderingDiagnosticKey).readDelayCycles > 0) {
+    val skew = LazyModule(new OrderingTLReadSkew(maxBytes,
+      p(GemminiOrderingDiagnosticKey).readDelayCycles))
+    xbar_node := TLBuffer() := skew.node := reader.node
+  } else {
+    xbar_node := TLBuffer() := reader.node
+  }
   xbar_node := TLBuffer() := writer.node
   exact_gather_reader.foreach(r => xbar_node := TLBuffer() := r.node)
   exact_gather_writer.foreach(w => xbar_node := TLBuffer() := w.node)
@@ -507,6 +513,26 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         mvin_scale_acc_in.ready, mvin_scale_in.ready))
 
     val mvin_scale_finished = mvin_scale_pixel_repeater.io.resp.fire && mvin_scale_pixel_repeater.io.resp.bits.last
+    // Observation only: no data, handshake, completion or busy signal changed.
+    val orderingClock = if (p(GemminiOrderingDiagnosticKey).trace) {
+      val t = RegInit(0.U(64.W)); t := t + 1.U; t
+    } else 0.U
+    if (p(GemminiOrderingDiagnosticKey).trace) {
+      when (reader.module.io.req.fire) {
+        val r = reader.module.io.req.bits
+        printf(p"[ORDER] t=${orderingClock} RD_REQ cmd=${r.cmd_id} addr=${r.spaddr} add=${r.accumulate} exact=${r.exact_resadd} va=0x${Hexadecimal(r.vaddr)}\n")
+      }
+      when (reader.module.io.resp.fire) {
+        val r = reader.module.io.resp.bits
+        printf(p"[ORDER] t=${orderingClock} RD_RETURN cmd=${r.cmd_id} addr=${r.addr} add=${r.accumulate} exact=${r.exact_resadd} first=0x${Hexadecimal(r.data(31,0))}\n")
+      }
+      when (io.dma.read.resp.fire) {
+        printf(p"[ORDER] t=${orderingClock} LD_ROW_DONE cmd=${io.dma.read.resp.bits.cmd_id} bytes=${io.dma.read.resp.bits.bytesRead}\n")
+      }
+      when (writer.module.io.req.fire) {
+        printf(p"[ORDER] t=${orderingClock} WR_ROW va=0x${Hexadecimal(writer.module.io.req.bits.vaddr)} first=0x${Hexadecimal(writer.module.io.req.bits.data(31,0))}\n")
+      }
+    }
     val mvin_scale_acc_finished = mvin_scale_acc_out.fire && mvin_scale_acc_out.bits.last
     val exact_resadd_finished = exact_resadd_scale.io.resp.fire &&
       exact_resadd_scale.io.resp.bits.last
@@ -919,11 +945,12 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     val acc_adders = Module(new AccPipeShared(acc_latency-1, acc_row_t, acc_banks))
 
     val acc_mems = {
-      val banks = Seq.fill(acc_banks) { Module(new AccumulatorMem(
+      val banks = Seq.tabulate(acc_banks) { bank => Module(new AccumulatorMem(
         acc_bank_entries, acc_row_t, acc_scale_func, acc_scale_t.asInstanceOf[V],
         acc_singleported, acc_sub_banks,
         use_shared_ext_mem, use_tl_ext_mem,
-        acc_latency, accType, is_dummy
+        acc_latency, accType, is_dummy,
+        orderingTrace = p(GemminiOrderingDiagnosticKey).trace, orderingBank = bank
       )) }
       val bank_ios = VecInit(banks.map(_.io))
 
@@ -1118,6 +1145,14 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
             mvin_scale_pixel_repeater.io.resp.ready := bio.write.ready
           }.otherwise {
             mvin_scale_acc_out.ready := bio.write.ready
+          }
+          if (p(GemminiOrderingDiagnosticKey).trace) {
+            val cmd = Mux(from_exact_resadd, exact_resadd_scale.io.resp.bits.tag.cmd_id,
+              Mux(from_mvin_scale, mvin_scale_pixel_repeater.io.resp.bits.tag.cmd_id,
+                mvin_scale_acc_out.bits.tag.cmd_id))
+            when (bio.write.fire) {
+              printf(p"[ORDER] t=${orderingClock} ACC_ACCEPT bank=${i.U} row=${bio.write.bits.addr} cmd=${cmd} add=${bio.write.bits.acc} first=0x${Hexadecimal(bio.write.bits.data.asUInt(31,0))}\n")
+            }
           }
         }.elsewhen (zerowrite && !spad_last && !consecutive_write_block) {
           bio.write.valid := true.B

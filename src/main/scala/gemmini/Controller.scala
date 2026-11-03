@@ -467,6 +467,22 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     store_controller.io.busy || ex_controller.io.busy)
   layer_matmul.foreach(_.io.downstreamIdle := layer_downstream_idle)
   io.busy := raw_cmd.valid || exact_gather_busy || layer_busy || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  if (p(GemminiOrderingDiagnosticKey).trace) {
+    val t = RegInit(0.U(64.W)); t := t + 1.U
+    val previousBusy = RegNext(io.busy, false.B)
+    when (previousBusy =/= io.busy) {
+      printf(p"[ORDER] t=${t} ROCC_BUSY value=${io.busy} rs=${reservation_station.io.busy} spad=${spad.module.io.busy} ld=${load_controller.io.busy} st=${store_controller.io.busy} ex=${ex_controller.io.busy}\n")
+    }
+    when (reservation_station.io.issue.ld.fire) {
+      printf(p"[ORDER] t=${t} LD_ISSUE rob=${reservation_station.io.issue.ld.rob_id} funct=${reservation_station.io.issue.ld.cmd.cmd.inst.funct} rs2=0x${Hexadecimal(reservation_station.io.issue.ld.cmd.cmd.rs2)}\n")
+    }
+    when (load_controller.io.completed.fire) {
+      printf(p"[ORDER] t=${t} LD_COMPLETE rob=${load_controller.io.completed.bits}\n")
+    }
+    when (!io.busy && (load_controller.io.busy || store_controller.io.busy || ex_controller.io.busy)) {
+      printf(p"[ORDER-ALERT] t=${t} busy-low-with-controller-active\n")
+    }
+  }
   if (has_layer_matmul) {
     // A command already accepted into the frontend must remain visible to
     // the CPU fence even when it is consumed before reaching LoopMatmul.

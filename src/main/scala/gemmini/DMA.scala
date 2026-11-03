@@ -559,6 +559,18 @@ class StreamWriter[T <: Data: Arithmetic](nXacts: Int, beatBits: Int, maxBytes: 
     tl.a.bits.address := RegEnableThru(io.tlb.resp.paddr, RegNext(io.tlb.req.fire))
 
     tl.d.ready := xactBusy.orR
+    if (p(GemminiOrderingDiagnosticKey).trace) {
+      val t = RegInit(0.U(64.W)); t := t + 1.U
+      when (tl.a.fire) {
+        printf(p"[ORDER] t=${t} WR_TL_A source=${tl.a.bits.source} addr=0x${Hexadecimal(tl.a.bits.address)} size=${tl.a.bits.size}\n")
+      }
+      when (tl.d.fire) {
+        printf(p"[ORDER] t=${t} WR_TL_ACK source=${tl.d.bits.source} denied=${tl.d.bits.denied}\n")
+      }
+      when (RegNext(io.busy, false.B) && !io.busy) {
+        printf(p"[ORDER] t=${t} WR_IDLE\n")
+      }
+    }
 
     when (untranslated_a.fire) {
       when (state === s_writing_new_block) {

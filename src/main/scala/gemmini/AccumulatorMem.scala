@@ -93,7 +93,8 @@ class AccumulatorMem[T <: Data, U <: Data](
   n: Int, t: Vec[Vec[T]], scale_func: (T, U) => T, scale_t: U,
   acc_singleported: Boolean, acc_sub_banks: Int,
   use_shared_ext_mem: Boolean, use_tl_ext_ram: Boolean,
-  acc_latency: Int, acc_type: T, is_dummy: Boolean
+  acc_latency: Int, acc_type: T, is_dummy: Boolean,
+  orderingTrace: Boolean = false, orderingBank: Int = 0
 )
   (implicit ev: Arithmetic[T]) extends Module {
   // TODO Do writes in this module work with matrices of size 2? If we try to read from an address right after writing
@@ -112,6 +113,9 @@ class AccumulatorMem[T <: Data, U <: Data](
 
   val pipelined_writes = Reg(Vec(acc_latency, Valid(new AccumulatorWriteReq(n, t))))
   val oldest_pipelined_write = pipelined_writes(acc_latency-1)
+  val orderingClock = if (orderingTrace) {
+    val t = RegInit(0.U(64.W)); t := t + 1.U; t
+  } else 0.U
   pipelined_writes(0).valid := io.write.fire
   pipelined_writes(0).bits  := io.write.bits
   for (i <- 1 until acc_latency) {
@@ -182,6 +186,11 @@ class AccumulatorMem[T <: Data, U <: Data](
     mem.io.wen := oldest_pipelined_write.valid
     mem.io.wdata := Mux(oldest_pipelined_write.bits.acc, adder_sum, oldest_pipelined_write.bits.data)
     mem.io.mask := oldest_pipelined_write.bits.mask
+    if (orderingTrace) {
+      when (mem.io.wen) {
+        printf(p"[ORDER] t=${orderingClock} ACC_COMMIT bank=${orderingBank.U} row=${mem.io.waddr} add=${oldest_pipelined_write.bits.acc} first=0x${Hexadecimal(mem.io.wdata.asUInt(31,0))}\n")
+      }
+    }
     rdata_for_adder := mem.io.rdata
     rdata_for_read_resp := mem.io.rdata
     mem.io.raddr := Mux(io.write.fire && io.write.bits.acc, io.write.bits.addr, io.read.req.bits.addr)
