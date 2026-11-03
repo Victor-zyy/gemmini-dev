@@ -427,7 +427,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     val (mvin_scale_in, mvin_scale_out) = VectorScalarMultiplier(
       config.mvin_scale_args,
       config.inputType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
-      is_acc = false
+      is_acc = false, fp32_pipeline = config.mvin_scale_fp32_pipeline
     )
     val (mvin_scale_acc_in, mvin_scale_acc_out) = if (mvin_scale_shared) (mvin_scale_in, mvin_scale_out) else (
       VectorScalarMultiplier(
@@ -443,7 +443,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     // this side path completely.
     val exact_resadd_scale = Module(new ExactResaddScaler(
       block_cols, inputType.getWidth, accType.getWidth,
-      chiselTypeOf(reader.module.io.resp.bits)))
+      chiselTypeOf(reader.module.io.resp.bits), config.exact_resadd_pipeline))
     exact_resadd_scale.io.req.valid := reader.module.io.resp.valid &&
       reader.module.io.resp.bits.exact_resadd
     exact_resadd_scale.io.req.bits.in :=

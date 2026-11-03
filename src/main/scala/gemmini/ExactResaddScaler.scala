@@ -30,7 +30,8 @@ class ExactResaddScaleResp[Tag <: Data](
 }
 
 class ExactResaddScaler[Tag <: Data](
-  blockCols: Int, inputWidth: Int, accWidth: Int, tagT: Tag) extends Module {
+  blockCols: Int, inputWidth: Int, accWidth: Int, tagT: Tag,
+  pipelined: Boolean = false) extends Module {
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(
       new ExactResaddScaleReq(blockCols, inputWidth, tagT)))
@@ -38,6 +39,11 @@ class ExactResaddScaler[Tag <: Data](
       new ExactResaddScaleResp(blockCols, accWidth, tagT))
   })
 
+  if (pipelined) {
+    val p = Module(new ExactResaddScalePipeline(blockCols, inputWidth, accWidth, tagT))
+    p.io.req <> io.req
+    io.resp <> p.io.resp
+  } else {
   val outputQ = Module(new Queue(
     new ExactResaddScaleResp(blockCols, accWidth, tagT),
     entries = 2, pipe = true))
@@ -69,5 +75,6 @@ class ExactResaddScaler[Tag <: Data](
       Mux(roundedSigned < minAcc, minAcc, roundedSigned))
 
     outputQ.io.enq.bits.out(lane) := saturated(accWidth - 1, 0).asSInt
+  }
   }
 }

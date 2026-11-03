@@ -30,20 +30,37 @@ class DataWithIndex[T <: Data, U <: Data](t: T, u: U) extends Bundle {
   val index = UInt()
 }
 
-class ScalePipe[T <: Data, U <: Data](t: T, mvin_scale_args: ScaleArguments[T, U]) extends Module {
+class ScalePipe[T <: Data, U <: Data](t: T, mvin_scale_args: ScaleArguments[T, U],
+  fp32_pipeline: Boolean = false) extends Module {
   val u = mvin_scale_args.multiplicand_t
   val io = IO(new Bundle {
     val in = Input(Valid(new DataWithIndex(t, u)))
     val out = Output(Valid(new DataWithIndex(t, u)))
   })
   val latency = mvin_scale_args.latency
-  val out = WireInit(io.in)
-  out.bits.data := mvin_scale_args.scale_func(io.in.bits.data, io.in.bits.scale.asTypeOf(u))
-  io.out := Pipe(out, latency)
+  if (fp32_pipeline) {
+    require(t.isInstanceOf[SInt] && t.getWidth == 8 &&
+      u.isInstanceOf[Float] && u.asInstanceOf[Float].expWidth == 8 &&
+      u.asInstanceOf[Float].sigWidth == 24 && !u.asInstanceOf[Float].isRecoded &&
+      latency == 8, "Pipelined MVIN requires INT8, IEEE FP32 and eight cycles")
+    val arithmetic = Module(new MvinScaleFP32Pipeline)
+    arithmetic.io.in.valid := io.in.valid
+    arithmetic.io.in.bits.data := io.in.bits.data.asUInt.asSInt
+    arithmetic.io.in.bits.scale := io.in.bits.scale.asUInt
+    // Entry ID and lane index must retire on exactly the arithmetic cycle.
+    io.out := Pipe(io.in, latency)
+    io.out.bits.data := arithmetic.io.out.bits.asTypeOf(t)
+    assert(io.out.valid === arithmetic.io.out.valid)
+  } else {
+    val out = WireInit(io.in)
+    out.bits.data := mvin_scale_args.scale_func(io.in.bits.data, io.in.bits.scale.asTypeOf(u))
+    io.out := Pipe(out, latency)
+  }
 }
 
 class VectorScalarMultiplier[T <: Data, U <: Data, Tag <: Data](
-  mvin_scale_args: Option[ScaleArguments[T, U]], block_cols: Int, t: T, tag_t: Tag
+  mvin_scale_args: Option[ScaleArguments[T, U]], block_cols: Int, t: T, tag_t: Tag,
+  fp32_pipeline: Boolean = false
 ) extends Module {
 
   val (u, num_scale_units, always_identity) = mvin_scale_args match {
@@ -57,6 +74,8 @@ class VectorScalarMultiplier[T <: Data, U <: Data, Tag <: Data](
   })
 
   val width = block_cols
+  require(!fp32_pipeline || num_scale_units > 0,
+    "Pipelined MVIN currently supports the shared-unit implementation only")
   val latency = mvin_scale_args match {
     case Some(ScaleArguments(_, latency, _, _, _, _)) => latency
     case None => 0
@@ -167,7 +186,7 @@ class VectorScalarMultiplier[T <: Data, U <: Data, Tag <: Data](
         arbOut.valid := false.B
       }
 
-      val pipe = Module(new ScalePipe(t, mvin_scale_args.get))
+      val pipe = Module(new ScalePipe(t, mvin_scale_args.get, fp32_pipeline))
       pipe.io.in := arbOut
       val pipe_out = pipe.io.out
       for (j <- 0 until nEntries) {
@@ -194,10 +213,11 @@ object VectorScalarMultiplier {
     scale_args: Option[ScaleArguments[T, U]],
     t: T, cols: Int, tag_t: Tag,
     is_acc: Boolean,
-    is_mvin: Boolean=true
+    is_mvin: Boolean=true,
+    fp32_pipeline: Boolean=false
   ) = {
     assert(!is_acc || is_mvin)
-    val vsm = Module(new VectorScalarMultiplier(scale_args, cols, t, tag_t))
+    val vsm = Module(new VectorScalarMultiplier(scale_args, cols, t, tag_t, fp32_pipeline))
     val vsm_in_q = Module(new Queue(chiselTypeOf(vsm.io.req.bits), 2))
     vsm.io.req <> vsm_in_q.io.deq
     (vsm_in_q.io.enq, vsm.io.resp) 
