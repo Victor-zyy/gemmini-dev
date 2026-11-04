@@ -113,8 +113,16 @@ class ExactGather(
   io.dma.req.bits.scale := currentBranch.scale
   io.dma.req.bits.status := savedStatus
 
-  io.busy := state =/= idle || io.dma.busy ||
-    (inputQ.valid && isGatherCommand)
+  // All commands traverse inputQ, including ordinary MVIN/MVOUT. Once a
+  // command leaves the upstream queue, it must remain visible to RoCC busy
+  // until the downstream frontend takes ownership. Restricting this term
+  // to Gather opcodes creates a one-cycle idle hole that can release a CPU
+  // fence before the ordinary command has even reached its controller.
+  io.busy := state =/= idle || io.dma.busy || inputQ.valid
+
+  when (inputQ.valid && !isGatherCommand) {
+    assert(io.busy, "ExactGather passthrough command lost from busy")
+  }
 
   when (state === idle && inputQ.fire) {
     when (isConfigBounds) {

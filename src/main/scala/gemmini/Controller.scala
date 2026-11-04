@@ -467,6 +467,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     store_controller.io.busy || ex_controller.io.busy)
   layer_matmul.foreach(_.io.downstreamIdle := layer_downstream_idle)
   io.busy := raw_cmd.valid || exact_gather_busy || layer_busy || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  exact_gather.foreach { gather =>
+    when (gather.io.out.valid) {
+      assert(io.busy, "ExactGather passthrough command lost from global RoCC busy")
+    }
+  }
   if (p(GemminiOrderingDiagnosticKey).trace) {
     val t = RegInit(0.U(64.W)); t := t + 1.U
     val previousBusy = RegNext(io.busy, false.B)
