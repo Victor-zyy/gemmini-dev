@@ -123,6 +123,28 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
   val entries_ex = Reg(Vec(reservation_station_entries_ex, UDValid(new Entry)))
   val entries_st = Reg(Vec(reservation_station_entries_st, UDValid(new Entry)))
 
+  // Same-queue deps_ld enforce issue order and are released on issue. DMA
+  // responses can return out of order, so overlapping ACC destinations also
+  // need a separate completion dependency. Keep it out of the EX/ST entries.
+  val acc_load_deps = RegInit(0.U.asTypeOf(Vec(reservation_station_entries_ld,
+    Vec(reservation_station_entries_ld, Bool()))))
+
+  def overlappingAccLoads(a: Entry, b: Entry): Bool = {
+    val ar = a.opa.bits
+    val br = b.opa.bits
+    val aBeforeBEnd = ar.start.full_acc_addr() < br.end.full_acc_addr()
+    val bBeforeAEnd = br.start.full_acc_addr() < ar.end.full_acc_addr()
+    // Half-open physical row ranges on a ring. A wrapped range also covers
+    // the low-address segment; the generic OpT comparison misses that case.
+    val overlap = Mux(ar.wraps_around || br.wraps_around,
+      (ar.wraps_around && br.wraps_around) || aBeforeBEnd || bBeforeAEnd,
+      aBeforeBEnd && bBeforeAEnd)
+    !a.is_config && !b.is_config && a.opa.valid && b.opa.valid &&
+      a.opa_is_dst && b.opa_is_dst &&
+      a.opa.bits.start.is_acc_addr && b.opa.bits.start.is_acc_addr &&
+      !ar.start.is_garbage() && !br.start.is_garbage() && overlap
+  }
+
   val entries = entries_ld ++ entries_ex ++ entries_st
 
   val empty_ld = !entries_ld.map(_.valid).reduce(_ || _)
@@ -431,11 +453,26 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     }
   }
 
+  // Include already-issued predecessors. This also handles allocation of B
+  // on the same edge that A issues; unlike deps_ld, these bits are NOT cleared
+  // by A's issue. LocalAddr comparisons ignore accumulate/full/exact metadata
+  // and compare physical ACC row ranges (including wrapped ranges).
+  entries_ld.indices.foreach { i =>
+    when (io.alloc.fire && new_allocs_oh_ld(i)) {
+      acc_load_deps(i) := VecInit(entries_ld.map { older =>
+        older.valid && overlappingAccLoads(new_entry, older.bits)
+      })
+    }
+  }
+
   // Issue commands which are ready to be issued
   Seq((ldq, io.issue.ld, entries_ld), (exq, io.issue.ex, entries_ex), (stq, io.issue.st, entries_st))
     .foreach { case (q, io, entries_type) =>
 
-    val issue_valids = entries_type.map(e => e.valid && e.bits.ready() && !e.bits.issued)
+    val issue_valids = entries_type.zipWithIndex.map { case (e, i) =>
+      val acc_load_ready = if (q == ldq) !acc_load_deps(i).asUInt.orR else true.B
+      e.valid && e.bits.ready() && !e.bits.issued && acc_load_ready
+    }
     val issue_sel = PriorityEncoderOH(issue_valids)
     val issue_id = OHToUInt(issue_sel)
     val global_issue_id = Cat(q.U(2.W), issue_id.pad(log2Up(res_max_per_type)))
@@ -453,6 +490,13 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val from_matmul_fsm = entries_type(issue_id).bits.cmd.from_matmul_fsm
 
     when (io.fire) {
+      if (q == ldq) {
+        entries_ld.foreach { older =>
+          assert(!(older.valid && older.bits.issued &&
+            overlappingAccLoads(issue_entry.bits, older.bits)),
+            "overlapping ACC LOAD issued before predecessor completed")
+        }
+      }
       entries_type.zipWithIndex.foreach { case (e, i) =>
         when (issue_sel(i)) {
           e.bits.issued := true.B
@@ -496,6 +540,15 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
 
     when (queue_type === ldqu) {
       entries.foreach(_.bits.deps_ld(issue_id) := false.B)
+      // DMA completion means all rows were accepted by the write path. Any
+      // final uncommitted write is still protected by AccumulatorMem's existing
+      // same-address RMW interlock and ordered write pipeline. No fixed delay.
+      // This assignment intentionally wins over same-cycle allocation above.
+      acc_load_deps.foreach { deps =>
+        deps.zipWithIndex.foreach { case (dep, i) =>
+          when (issue_id === i.U) { dep := false.B }
+        }
+      }
       entries_ld(issue_id).valid := false.B
 
       conv_ld_completed := entries_ld(issue_id).bits.cmd.from_conv_fsm
